@@ -1,4 +1,8 @@
-"""Telegram update handlers: menus, tool flows, account, AI assistant."""
+"""Telegram update handlers: menus, tool flows, account, AI assistant.
+
+Gracefully degrades when AI is disabled — AI tools show a friendly notice,
+while Website Analysis and Competitor Analysis keep working on public data.
+"""
 
 import logging
 from typing import Optional
@@ -11,10 +15,10 @@ from ai_service import AIError, AIService
 from config import Config
 from database import Database
 from keyboards import (
-    account_keyboard, back_to_category, category_keyboard, category_label,
-    chat_active_keyboard, help_keyboard, main_menu_keyboard, tool_active_keyboard,
+    account_keyboard, category_keyboard, chat_active_keyboard, help_keyboard,
+    main_menu_keyboard, tool_active_keyboard,
 )
-from seo_tools import CATEGORIES, TOOLS
+from seo_tools import CATEGORIES, CATEGORY_TO_TOOLS, TOOLS
 from website_analyzer import (
     UnsafeURLError, analyze_html, fetch_html, format_audit_summary,
 )
@@ -29,12 +33,23 @@ WELCOME_TEXT = (
     "Choose a tool below to get started."
 )
 
+AI_DISABLED_TEXT = (
+    "🤖 *AI features are not enabled on this deployment.*\n\n"
+    "The following tools still work without AI:\n"
+    "• 🌐 *Website Analysis* — public page SEO audit\n"
+    "• ⚔️ *Competitor Analysis* — public page comparison\n"
+    "• 👤 *My Account*, ❓ *Help & Support*\n\n"
+    "To unlock AI tools (content writing, keyword research, SEO generators, "
+    "AI Assistant, and AI recommendations on audits), set these Railway variables:\n"
+    "`AI_API_KEY`, `AI_BASE_URL`, `AI_MODEL`."
+)
+
 HELP_TEXT = (
     "❓ *Help & Support*\n\n"
     "How to use the bot:\n"
     "1. Tap any tool from the main menu.\n"
     "2. Follow the on-screen instruction to send your input.\n"
-    "3. Receive an AI-generated response in seconds.\n\n"
+    "3. Receive a response.\n\n"
     "Available commands:\n"
     "• /start – Open the main menu\n"
     "• /help – Show this help message\n"
@@ -44,30 +59,34 @@ HELP_TEXT = (
     "Notes:\n"
     "• AI outputs are estimates unless stated otherwise.\n"
     "• Verified SEO metrics require a data provider.\n"
-    "• The bot never guarantees rankings, traffic, or sales.\n\n"
-    "Need something specific? Use the AI Assistant from the main menu."
+    "• The bot never guarantees rankings, traffic, or sales."
 )
 
 ABOUT_TEXT = (
     "ℹ️ *About High Value Market Bot*\n\n"
-    "An intelligent SEO and digital marketing assistant built for entrepreneurs, "
-    "marketers, freelancers, website owners, and agencies.\n\n"
+    "An SEO and digital marketing assistant built for entrepreneurs, marketers, "
+    "freelancers, website owners, and agencies.\n\n"
     "What it does:\n"
-    "• SEO tooling & analysis\n"
-    "• Keyword research & clustering\n"
     "• Public-page website audits\n"
-    "• AI content generation\n"
-    "• Marketing, social media & backlink strategy\n"
-    "• Conversational AI marketing assistant\n\n"
-    "Important: this bot uses AI to generate recommendations. "
-    "It does not access Google Analytics, Google Search Console, or any private "
-    "website data. Verified SEO metrics require a third-party data provider.\n\n"
-    "We do not promise guaranteed rankings, traffic, or sales."
+    "• Public-page competitor comparison\n"
+    "• AI tooling (when AI is configured)\n\n"
+    "Important: this bot does not access Google Analytics, Google Search Console, "
+    "or any private website data. Verified SEO metrics require a third-party data "
+    "provider. We do not promise guaranteed rankings, traffic, or sales."
 )
+
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+def _ai_enabled(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    return context.bot_data.get("ai") is not None
+
+
+def _ai(context: ContextTypes.DEFAULT_TYPE) -> Optional[AIService]:
+    return context.bot_data.get("ai")
+
 
 def _split_message(text: str, limit: int = 4000) -> list[str]:
     if len(text) <= limit:
@@ -100,7 +119,6 @@ async def _send_long(update: Update, text: str, reply_markup=None) -> None:
 
 
 async def _check_and_charge(update: Update, context: ContextTypes.DEFAULT_TYPE, tool: str) -> bool:
-    """Return True if user is allowed to use a tool; charge quota only after success elsewhere."""
     db: Database = context.bot_data["db"]
     cfg: Config = context.bot_data["config"]
     user = update.effective_user
@@ -136,8 +154,11 @@ async def _charge(update: Update, context: ContextTypes.DEFAULT_TYPE, tool: str,
         await db.touch_usage(user.id, tool, success, error)
 
 
-async def _ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> AIService:
-    return context.bot_data["ai"]
+async def _show_ai_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        AI_DISABLED_TEXT, parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -191,38 +212,38 @@ async def endchat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # account
 # ---------------------------------------------------------------------------
 
-async def _show_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    db: Database = context.bot_data["db"]
+async def _account_text(context: ContextTypes.DEFAULT_TYPE, user, record: dict, usage: dict) -> str:
     cfg: Config = context.bot_data["config"]
-    user = update.effective_user
-    if not user:
-        return
-    await db.upsert_user(user.id, user.username, user.first_name)
-    record = await db.get_user(user.id) or {}
-    usage = await db.get_usage(user.id)
-
     tier = "⭐ Premium" if usage["premium"] else "🆓 Free"
     limit = usage["override"] if usage["override"] is not None else (
         cfg.premium_daily_limit if usage["premium"] else cfg.free_daily_limit
     )
-    text = (
-        "👤 *My Account*\n\n"
-        f"• User ID: `{user.id}`\n"
-        f"• Username: @{user.username}" if user.username else f"• User ID: `{user.id}`\n• Username: —"
-    )
-    text = (
+    ai_status = "✅ enabled" if _ai_enabled(context) else "🚫 not configured"
+    return (
         "👤 *My Account*\n\n"
         f"• User ID: `{user.id}`\n"
         f"• Username: @{user.username if user.username else '—'}\n"
         f"• Status: {tier}\n"
+        f"• AI features: {ai_status}\n"
         f"• Total requests: {record.get('total_requests', 0)}\n"
         f"• Used today: {usage['used_today']} / {limit}\n"
         f"• First seen: {record.get('first_seen', '—')[:10]}\n"
         f"• Last seen: {record.get('last_seen', '—')[:10]}\n\n"
         "Contact an admin to upgrade to Premium."
     )
+
+
+async def _show_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db: Database = context.bot_data["db"]
+    user = update.effective_user
+    if not user:
+        return
+    await db.upsert_user(user.id, user.username, user.first_name)
+    record = await db.get_user(user.id) or {}
+    usage = await db.get_usage(user.id)
     await update.effective_message.reply_text(
-        text, parse_mode=ParseMode.MARKDOWN, reply_markup=account_keyboard(),
+        await _account_text(context, user, record, usage),
+        parse_mode=ParseMode.MARKDOWN, reply_markup=account_keyboard(),
     )
 
 
@@ -248,9 +269,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if data == "end_chat":
         context.user_data.pop("state", None)
         context.user_data.pop("chat_history", None)
-        await query.edit_message_text(
-            "✅ Chat ended.", reply_markup=main_menu_keyboard(),
-        )
+        await query.edit_message_text("✅ Chat ended.", reply_markup=main_menu_keyboard())
         return
 
     if data == "menu_account":
@@ -280,29 +299,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def _show_account_from_query(update: Update, context: ContextTypes.DEFAULT_TYPE, query) -> None:
     db: Database = context.bot_data["db"]
-    cfg: Config = context.bot_data["config"]
     user = update.effective_user
     if not user:
         return
     await db.upsert_user(user.id, user.username, user.first_name)
     record = await db.get_user(user.id) or {}
     usage = await db.get_usage(user.id)
-    tier = "⭐ Premium" if usage["premium"] else "🆓 Free"
-    limit = usage["override"] if usage["override"] is not None else (
-        cfg.premium_daily_limit if usage["premium"] else cfg.free_daily_limit
+    await query.edit_message_text(
+        await _account_text(context, user, record, usage),
+        parse_mode=ParseMode.MARKDOWN, reply_markup=account_keyboard(),
     )
-    text = (
-        "👤 *My Account*\n\n"
-        f"• User ID: `{user.id}`\n"
-        f"• Username: @{user.username if user.username else '—'}\n"
-        f"• Status: {tier}\n"
-        f"• Total requests: {record.get('total_requests', 0)}\n"
-        f"• Used today: {usage['used_today']} / {limit}\n"
-        f"• First seen: {record.get('first_seen', '—')[:10]}\n"
-        f"• Last seen: {record.get('last_seen', '—')[:10]}\n\n"
-        "Contact an admin to upgrade to Premium."
-    )
-    await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=account_keyboard())
 
 
 # ---------------------------------------------------------------------------
@@ -310,11 +316,12 @@ async def _show_account_from_query(update: Update, context: ContextTypes.DEFAULT
 # ---------------------------------------------------------------------------
 
 async def _start_tool(update: Update, context: ContextTypes.DEFAULT_TYPE, query, tool_id: str) -> None:
+    # Always-available tools (work without AI)
     if tool_id == "website_analysis":
         context.user_data["state"] = {"tool": "website_analysis"}
         await query.edit_message_text(
             "🌐 *Website Analysis*\n\nSend me a public URL to audit, e.g. `https://example.com`.\n\n"
-            "I will only inspect publicly available HTML — never Google Search Console or private data.",
+            "I will inspect publicly available HTML — never Google Search Console or private data.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=tool_active_keyboard(),
         )
@@ -323,14 +330,21 @@ async def _start_tool(update: Update, context: ContextTypes.DEFAULT_TYPE, query,
     if tool_id == "competitor_analysis":
         context.user_data["state"] = {"tool": "competitor_analysis"}
         await query.edit_message_text(
-            "⚔️ *Competitor Analysis*\n\nSend up to 3 public competitor URLs separated by spaces or new lines.\n"
-            "I will fetch each page, analyze on-page SEO, and generate a competitive report.",
+            "⚔️ *Competitor Analysis*\n\nSend up to 3 public competitor URLs separated by "
+            "spaces or new lines. I will fetch each page and compare on-page SEO.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=tool_active_keyboard(),
         )
         return
 
+    # AI-only tools
     if tool_id == "ai_assistant":
+        if not _ai_enabled(context):
+            await query.edit_message_text(
+                AI_DISABLED_TEXT, parse_mode=ParseMode.MARKDOWN,
+                reply_markup=main_menu_keyboard(),
+            )
+            return
         context.user_data["state"] = {"tool": "ai_assistant"}
         context.user_data.setdefault("chat_history", [])
         await query.edit_message_text(
@@ -346,6 +360,13 @@ async def _start_tool(update: Update, context: ContextTypes.DEFAULT_TYPE, query,
         await query.edit_message_text("Unknown tool.", reply_markup=main_menu_keyboard())
         return
 
+    if not _ai_enabled(context):
+        await query.edit_message_text(
+            AI_DISABLED_TEXT, parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
     context.user_data["state"] = {"tool": tool_id}
     await query.edit_message_text(
         f"*{tool['label']}*\n\n{tool['input_hint']}",
@@ -355,7 +376,7 @@ async def _start_tool(update: Update, context: ContextTypes.DEFAULT_TYPE, query,
 
 
 # ---------------------------------------------------------------------------
-# text handler (routes inputs to the pending tool)
+# text handler
 # ---------------------------------------------------------------------------
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -396,10 +417,15 @@ async def _handle_ai_tool(update: Update, context: ContextTypes.DEFAULT_TYPE, to
     if not tool or message is None:
         return
 
+    if not _ai_enabled(context):
+        await _show_ai_disabled(update, context)
+        return
+
     if not await _check_and_charge(update, context, tool_id):
         return
 
-    ai: AIService = await _ai(update, context)
+    ai = _ai(context)
+    assert ai is not None
     await message.chat.send_action(ChatAction.TYPING)
     try:
         response = await ai.ask(tool["system"], message.text, max_tokens=2500)
@@ -419,7 +445,7 @@ async def _handle_ai_tool(update: Update, context: ContextTypes.DEFAULT_TYPE, to
         return
 
     await _charge(update, context, tool_id, True)
-    context.user_data["state"] = {"tool": tool_id}  # allow repeat
+    context.user_data["state"] = {"tool": tool_id}
     await _send_long(update, response, reply_markup=tool_active_keyboard())
 
 
@@ -440,15 +466,19 @@ async def _handle_assistant(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     message = update.effective_message
     if message is None or not message.text:
         return
+    if not _ai_enabled(context):
+        await _show_ai_disabled(update, context)
+        return
     if not await _check_and_charge(update, context, "ai_assistant"):
         return
 
     history: list[dict] = context.user_data.setdefault("chat_history", [])
     history.append({"role": "user", "content": message.text})
-    history[:] = history[-10:]  # trim
+    history[:] = history[-10:]
 
     messages = [{"role": "system", "content": ASSISTANT_SYSTEM}] + history
-    ai: AIService = await _ai(update, context)
+    ai = _ai(context)
+    assert ai is not None
     await message.chat.send_action(ChatAction.TYPING)
     try:
         reply = await ai.complete(messages, max_tokens=1500)
@@ -469,7 +499,7 @@ async def _handle_assistant(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 # ---------------------------------------------------------------------------
-# Website analysis
+# Website analysis (works WITHOUT AI)
 # ---------------------------------------------------------------------------
 
 async def _handle_website_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -507,8 +537,20 @@ async def _handle_website_analysis(update: Update, context: ContextTypes.DEFAULT
     summary = format_audit_summary(data)
     await _send_long(update, summary)
 
-    # AI-generated recommendations based on the fetched data
-    ai: AIService = await _ai(update, context)
+    # AI recommendations are optional
+    if not _ai_enabled(context):
+        await _charge(update, context, "website_analysis", True)
+        await message.reply_text(
+            "✅ *Public-page audit complete.*\n\n"
+            "_AI recommendations are unavailable because AI is not configured on this "
+            "deployment. The audit above is real, on-page data._",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=tool_active_keyboard(),
+        )
+        return
+
+    ai = _ai(context)
+    assert ai is not None
     ai_prompt = (
         "Below is structured data extracted from a public web page. Generate a concise "
         "SEO audit with: prioritized fixes, quick wins, and recommended next steps. "
@@ -542,8 +584,47 @@ async def _handle_website_analysis(update: Update, context: ContextTypes.DEFAULT
 
 
 # ---------------------------------------------------------------------------
-# Competitor analysis
+# Competitor analysis (works WITHOUT AI)
 # ---------------------------------------------------------------------------
+
+def _format_competitor_block(data: dict, idx: int) -> str:
+    title = data.get("title") or "(missing)"
+    title_len = data.get("title_length") or 0
+    meta = data.get("meta_description")
+    meta_str = f"{len(meta)} chars" if meta else "❌ missing"
+    h1s = data.get("h1s") or []
+    h1_str = f"{len(h1s)}" + (f" — {h1s[0][:60]}" if h1s else "")
+    return (
+        f"*{idx}. {data['url']}*\n"
+        f"• Title ({title_len} chars): {title[:90]}\n"
+        f"• Meta description: {meta_str}\n"
+        f"• H1s: {h1_str}\n"
+        f"• Word count: {data.get('word_count', 0)}\n"
+        f"• Internal links: {data.get('internal_links', 0)}\n"
+        f"• External links: {data.get('external_links', 0)}\n"
+        f"• Images: {data.get('images', 0)} ({data.get('images_missing_alt', 0)} missing alt)"
+    )
+
+
+def _build_competitor_summary(results: list[dict]) -> str:
+    if not results:
+        return "No comparable data."
+    longest = max(results, key=lambda r: r.get("word_count", 0))
+    best_title = sorted(
+        results,
+        key=lambda r: abs((r.get("title_length") or 0) - 55),
+    )[0]
+    missing_meta = [r["url"] for r in results if not r.get("meta_description")]
+    missing_h1 = [r["url"] for r in results if r.get("h1_count", 0) == 0]
+    lines = ["📋 *On-page comparison summary:*"]
+    lines.append(f"• Longest content: {longest['url']} ({longest.get('word_count', 0)} words)")
+    lines.append(f"• Best title length: {best_title['url']}")
+    if missing_meta:
+        lines.append(f"• Missing meta descriptions: {', '.join(missing_meta)}")
+    if missing_h1:
+        lines.append(f"• Missing H1: {', '.join(missing_h1)}")
+    return "\n".join(lines)
+
 
 async def _handle_competitor_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
@@ -558,19 +639,19 @@ async def _handle_competitor_analysis(update: Update, context: ContextTypes.DEFA
         return
 
     await message.chat.send_action(ChatAction.TYPING)
-    results = []
+    results: list[dict] = []
+    errors: list[str] = []
     for u in urls:
         try:
             final_url, html = await fetch_html(u)
             results.append(analyze_html(html, final_url))
         except UnsafeURLError as exc:
-            results.append({"url": u, "error": str(exc)})
+            errors.append(f"{u} — {exc}")
         except Exception as exc:  # noqa: BLE001
             logger.warning("Competitor fetch failed for %s: %s", u, exc)
-            results.append({"url": u, "error": "fetch failed"})
+            errors.append(f"{u} — fetch failed")
 
-    successful = [r for r in results if "error" not in r]
-    if not successful:
+    if not results:
         await _charge(update, context, "competitor_analysis", False, "all_fetch_failed")
         await message.reply_text(
             "⚠️ Could not fetch any of the URLs. Please check the addresses.",
@@ -578,8 +659,30 @@ async def _handle_competitor_analysis(update: Update, context: ContextTypes.DEFA
         )
         return
 
+    # Always show real on-page comparison
+    header = ["⚔️ *Competitor Analysis — public page comparison*", ""]
+    blocks = [_format_competitor_block(r, i + 1) for i, r in enumerate(results)]
+    summary = _build_competitor_summary(results)
+    footer = ""
+    if errors:
+        footer = "\n\n⚠️ *Could not fetch:*\n• " + "\n• ".join(errors)
+    body = "\n\n".join(header) + "\n\n".join(blocks) + "\n\n" + summary + footer
+    await _send_long(update, body)
+
+    # Optional AI layer
+    if not _ai_enabled(context):
+        await _charge(update, context, "competitor_analysis", True)
+        await message.reply_text(
+            "✅ *Public-page comparison complete.*\n\n"
+            "_AI strategic recommendations are unavailable because AI is not configured. "
+            "Enable AI by setting `AI_API_KEY`, `AI_BASE_URL`, `AI_MODEL`._",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=tool_active_keyboard(),
+        )
+        return
+
     compact = []
-    for r in successful:
+    for r in results:
         compact.append({
             "url": r["url"],
             "title": r["title"],
@@ -592,7 +695,8 @@ async def _handle_competitor_analysis(update: Update, context: ContextTypes.DEFA
             "headings": r["headings"][:15],
         })
 
-    ai: AIService = await _ai(update, context)
+    ai = _ai(context)
+    assert ai is not None
     prompt = (
         "The following pages are public competitor pages. Generate a competitive SEO report:\n"
         "1. Overview of each competitor (on-page observations only).\n"
@@ -610,13 +714,15 @@ async def _handle_competitor_analysis(update: Update, context: ContextTypes.DEFA
             prompt, max_tokens=2200,
         )
     except AIError:
-        await _charge(update, context, "competitor_analysis", False, "ai_error")
-        await message.reply_text("⚠️ AI service unavailable. Please try again.",
-                                 reply_markup=tool_active_keyboard())
+        await _charge(update, context, "competitor_analysis", True)
+        await message.reply_text(
+            "✅ Comparison complete. AI recommendations unavailable right now.",
+            reply_markup=tool_active_keyboard(),
+        )
         return
 
     await _charge(update, context, "competitor_analysis", True)
-    await _send_long(update, f"⚔️ *Competitor Analysis*\n\n{report}",
+    await _send_long(update, f"🤖 *AI Strategic Report*\n\n{report}",
                      reply_markup=tool_active_keyboard())
 
 
@@ -661,7 +767,6 @@ def register_handlers(application) -> None:
     application.add_handler(CommandHandler("account", account_cmd))
     application.add_handler(CommandHandler("endchat", endchat_cmd))
 
-    # admin
     application.add_handler(CommandHandler("admin", admin_cmd))
     application.add_handler(CommandHandler("stats", stats_cmd))
     application.add_handler(CommandHandler("users", users_cmd))
