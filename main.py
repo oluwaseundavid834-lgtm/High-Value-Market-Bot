@@ -1,9 +1,10 @@
 """High Value Market Bot — entry point.
 
-Supports both webhook (preferred on Railway) and polling (dev) modes.
+Runs fine without AI configured. AI tools simply become unavailable and the
+non-AI tools (Website Analysis, Competitor Analysis, Account, Admin) keep
+working.
 """
 
-import asyncio
 import logging
 import os
 import sys
@@ -23,7 +24,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram.ext.Application").setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +32,24 @@ def build_application() -> tuple[FastAPI, Application, Database, object]:
     config = load_config()
 
     db = Database(config.database_path)
-    ai = AIService(
-        api_key=config.ai_api_key,
-        base_url=config.ai_base_url,
-        model=config.ai_model,
-        timeout=config.ai_timeout,
-    )
+
+    ai = None
+    if config.ai_enabled:
+        ai = AIService(
+            api_key=config.ai_api_key,
+            base_url=config.ai_base_url,
+            model=config.ai_model,
+            timeout=config.ai_timeout,
+        )
+        logger.info("AI features: ENABLED (model=%s, base=%s)", config.ai_model, config.ai_base_url)
+    else:
+        logger.info("AI features: DISABLED — set AI_API_KEY, AI_BASE_URL and AI_MODEL to enable")
+        partial = bool(config.ai_api_key or config.ai_base_url or config.ai_model)
+        if partial:
+            logger.warning(
+                "Partial AI config detected (some but not all AI_* vars are set). "
+                "Set all three or none. AI remains disabled."
+            )
 
     ptb = Application.builder().token(config.telegram_token).build()
     ptb.bot_data["db"] = db
@@ -74,11 +86,11 @@ def build_application() -> tuple[FastAPI, Application, Database, object]:
 
     @fastapi_app.get("/health")
     async def _health():
-        return {"status": "ok"}
+        return {"status": "ok", "ai_enabled": config.ai_enabled}
 
     @fastapi_app.get("/")
     async def _root():
-        return {"bot": "High Value Market Bot", "status": "running"}
+        return {"bot": "High Value Market Bot", "status": "running", "ai_enabled": config.ai_enabled}
 
     @fastapi_app.post(config.webhook_path)
     async def _webhook(request: Request):
@@ -91,6 +103,17 @@ def build_application() -> tuple[FastAPI, Application, Database, object]:
 
 
 def main() -> None:
+    # Presence check — prints only presence, never secrets
+    print(
+        "ENV CHECK:",
+        "TELEGRAM_BOT_TOKEN=" + ("set" if os.environ.get("TELEGRAM_BOT_TOKEN") else "MISSING"),
+        "ADMIN_ID=" + ("set" if os.environ.get("ADMIN_ID") else "MISSING"),
+        "AI_API_KEY=" + ("set" if os.environ.get("AI_API_KEY") else "MISSING"),
+        "AI_BASE_URL=" + ("set" if os.environ.get("AI_BASE_URL") else "MISSING"),
+        "AI_MODEL=" + ("set" if os.environ.get("AI_MODEL") else "MISSING"),
+        flush=True,
+    )
+
     try:
         app, _ptb, _db, config = build_application()
     except RuntimeError as exc:
