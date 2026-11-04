@@ -1,8 +1,7 @@
 """High Value Market Bot — entry point.
 
-Runs fine without AI configured. AI tools simply become unavailable and the
-non-AI tools (Website Analysis, Competitor Analysis, Account, Admin) keep
-working.
+Runs fine without AI configured. Uses a custom FastAPI webhook server on
+Railway; falls back to long-polling locally when no public domain is set.
 """
 
 import logging
@@ -41,17 +40,17 @@ def build_application() -> tuple[FastAPI, Application, Database, object]:
             model=config.ai_model,
             timeout=config.ai_timeout,
         )
-        logger.info("AI features: ENABLED (model=%s, base=%s)", config.ai_model, config.ai_base_url)
+        logger.info("AI features: ENABLED (model=%s)", config.ai_model)
     else:
-        logger.info("AI features: DISABLED — set AI_API_KEY, AI_BASE_URL and AI_MODEL to enable")
-        partial = bool(config.ai_api_key or config.ai_base_url or config.ai_model)
-        if partial:
-            logger.warning(
-                "Partial AI config detected (some but not all AI_* vars are set). "
-                "Set all three or none. AI remains disabled."
-            )
+        logger.info("AI features: DISABLED — set AI_API_KEY, AI_BASE_URL, AI_MODEL to enable")
 
-    ptb = Application.builder().token(config.telegram_token).build()
+    # IMPORTANT: .updater(None) — we drive updates via FastAPI, not PTB polling.
+    ptb = (
+        Application.builder()
+        .token(config.telegram_token)
+        .updater(None)
+        .build()
+    )
     ptb.bot_data["db"] = db
     ptb.bot_data["ai"] = ai
     ptb.bot_data["config"] = config
@@ -68,11 +67,17 @@ def build_application() -> tuple[FastAPI, Application, Database, object]:
 
         if config.webhook_url:
             webhook = f"{config.webhook_url.rstrip('/')}{config.webhook_path}"
-            await ptb.bot.set_webhook(url=webhook, allowed_updates=Update.ALL_TYPES)
-            logger.info("Webhook set to %s", webhook)
+            await ptb.bot.set_webhook(
+                url=webhook,
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+            )
+            info = await ptb.bot.get_webhook_info()
+            logger.info("Webhook set to %s (pending=%s)", info.url, info.pending_update_count)
         else:
-            await ptb.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-            logger.info("Polling mode started")
+            # Local dev: use long polling. Requires the default updater, so this
+            # branch only works if you remove .updater(None) above.
+            logger.warning("No webhook URL — long polling requires the default Updater.")
 
     @fastapi_app.on_event("shutdown")
     async def _on_shutdown() -> None:
@@ -86,31 +91,36 @@ def build_application() -> tuple[FastAPI, Application, Database, object]:
 
     @fastapi_app.get("/health")
     async def _health():
-        return {"status": "ok", "ai_enabled": config.ai_enabled}
+        info = await ptb.bot.get_webhook_info()
+        return {
+            "status": "ok",
+            "ai_enabled": config.ai_enabled,
+            "webhook_url": info.url,
+            "pending_updates": info.pending_update_count,
+            "last_error": info.last_error_message,
+        }
 
     @fastapi_app.get("/")
     async def _root():
-        return {"bot": "High Value Market Bot", "status": "running", "ai_enabled": config.ai_enabled}
+        return {"bot": "High Value Market Bot", "status": "running"}
 
     @fastapi_app.post(config.webhook_path)
     async def _webhook(request: Request):
         data = await request.json()
         update = Update.de_json(data, ptb.bot)
-        await ptb.update_queue.put(update)
+        # ✅ process_update() — not update_queue.put()
+        await ptb.process_update(update)
         return Response(content="ok", media_type="text/plain")
 
     return fastapi_app, ptb, db, config
 
 
 def main() -> None:
-    # Presence check — prints only presence, never secrets
     print(
         "ENV CHECK:",
         "TELEGRAM_BOT_TOKEN=" + ("set" if os.environ.get("TELEGRAM_BOT_TOKEN") else "MISSING"),
         "ADMIN_ID=" + ("set" if os.environ.get("ADMIN_ID") else "MISSING"),
         "AI_API_KEY=" + ("set" if os.environ.get("AI_API_KEY") else "MISSING"),
-        "AI_BASE_URL=" + ("set" if os.environ.get("AI_BASE_URL") else "MISSING"),
-        "AI_MODEL=" + ("set" if os.environ.get("AI_MODEL") else "MISSING"),
         flush=True,
     )
 
@@ -121,6 +131,7 @@ def main() -> None:
         sys.exit(1)
 
     port = int(os.environ.get("PORT", config.port))
+    logger.info("Starting Uvicorn on 0.0.0.0:%s", port)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
 
 
